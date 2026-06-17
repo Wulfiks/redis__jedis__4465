@@ -1,0 +1,12 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "src/test/java/redis/clients/jedis/HostAndPortTest.java",
+    "src/test/java/redis/clients/jedis/util/JedisClusterCRC16Test.java",
+    "src/test/java/redis/clients/jedis/util/JedisURIHelperTest.java",
+    "src/test/java/redis/clients/jedis/params/SetParamsTest.java",
+    "src/test/java/redis/clients/jedis/collections/SetFromListTest.java"
+  ],
+  "validation_test_file_count": 5,
+  "validation_tests_executed": 56
+}

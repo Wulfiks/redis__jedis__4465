@@ -1,0 +1,734 @@
+# Automatic Failover and Failback with Jedis
+
+> API was significantly changed in 7.0.0. Please follow the migration guide below.
+> 
+> This feature is experimental and may change in future versions.
+
+Jedis supports failover and failback for your Redis deployments. This is useful when:
+1. You have more than one Redis deployment. This might include two independent Redis servers or two or more Redis databases replicated across multiple [active-active Redis Enterprise](https://docs.redis.com/latest/rs/databases/active-active/) clusters.
+2. You want your application to connect to and use one deployment at a time.
+3. You want your application to fail over to the next available deployment if the current deployment becomes unavailable.
+4. You want your application to fail back to the original deployment when it becomes available again.
+
+Jedis will fail over to a subsequent Redis deployment after reaching a configurable failure threshold.
+This failure threshold is implemented using a [circuit breaker pattern](https://en.wikipedia.org/wiki/Circuit_breaker_design_pattern).
+
+You can also configure Jedis to retry failed calls to Redis.
+Once a maximum number of retries have been exhausted, the circuit breaker will record a failure.
+When the circuit breaker reaches its failure threshold, a failover will be triggered on the subsequent operation.
+In the background, Jedis executes configured health checks to determine when a Redis deployment is available again.
+When this occurs, Jedis will fail back to the original deployment after a configurable grace period.
+
+The remainder of this guide describes:
+
+* A basic failover and health check configuration
+* Supported retry and circuit breaker settings
+* Failback and the database selection API
+* Dynamic database management for adding and removing databases at runtime
+* Dynamic weight management for runtime priority adjustments (since 7.4.0)
+
+We recommend that you read this guide carefully and understand the configuration settings before enabling Jedis failover
+in production.
+
+## Migration from 6.x to 7.x
+
+In Jedis 6.x, failover was supported using special constructor for `UnifiedJedis`.
+In Jedis 7.x, failover is supported using `MultiDbClient` and `MultiDbConfig.builder`:
+```java
+// Jedis 6.x
+JedisClientConfig config = DefaultJedisClientConfig.builder().user("cache").password("secret").build();
+
+ClusterConfig[] clientConfigs = new ClusterConfig[2];
+clientConfigs[0] = new ClusterConfig(new HostAndPort("redis-east.example.com", 14000), config);
+clientConfigs[1] = new ClusterConfig(new HostAndPort("redis-west.example.com", 14000), config);
+
+MultiClusterClientConfig.Builder builder = new MultiClusterClientConfig.Builder(clientConfigs);
+// ...
+MultiClusterPooledConnectionProvider provider = new MultiClusterPooledConnectionProvider(builder.build());
+UnifiedJedis client = new UnifiedJedis(provider);
+
+// Jedis 7.x
+// MultiClusterClientConfig was renamed to MultiDbConfig and MultiDbClient with convenient builder was added
+MultiDbConfig multiConfig = MultiDbConfig.builder()
+        .database(DatabaseConfig.builder(east, config).weight(1.0f).build())
+        .database(DatabaseConfig.builder(west, config).weight(0.5f).build())
+        .build();
+// Use MultiDbClient instead of UnifiedJedis
+MultiDbClient multiDbClient = MultiDbClient.builder().multiDbConfig(multiConfig).build();
+```
+For more details on configuration options see sections below.
+
+## Installing optional dependencies
+
+Jedis failover support is provided by optional dependencies.
+To use failover, add the following dependencies to your project:
+```xml
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-all</artifactId>
+    <version>1.7.1</version>
+</dependency>
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-circuitbreaker</artifactId>
+    <version>1.7.1</version>
+</dependency>
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-retry</artifactId>
+    <version>1.7.1</version>
+</dependency>
+```
+
+## Basic usage
+
+To configure Jedis for failover, you specify a weighted list of Redis databases.
+Jedis will connect to the Redis database in the list with the highest weight. 
+If the highest-weighted database becomes unavailable,
+Jedis will attempt to connect to the database with the next highest weight in the list, and so on.
+
+Database weights determine the priority for selecting which database becomes active. Weights can be configured at initialization and can also be changed dynamically at runtime (introduced in version 7.4.0), allowing you to adjust active database selection priorities without recreating the client.
+
+Suppose you run two Redis deployments.
+We'll call them `redis-east` and `redis-west`.
+You want your application to first connect to `redis-east`.
+If `redis-east` becomes unavailable, you want your application to connect to `redis-west`.
+
+Let's look at one way of configuring Jedis for this scenario.
+
+First, start by defining the initial configuration for each Redis database available and prioritize them using weights.
+
+```java
+JedisClientConfig config = DefaultJedisClientConfig.builder()
+        .user("cache").password("secret")
+        .socketTimeoutMillis(5000).connectionTimeoutMillis(5000).build();
+
+// Custom pool config per database can be provided
+ConnectionPoolConfig poolConfig = new ConnectionPoolConfig();
+poolConfig.setMaxTotal(8);
+poolConfig.setMaxIdle(8);
+poolConfig.setMinIdle(0);
+poolConfig.setBlockWhenExhausted(true);
+poolConfig.setMaxWait(Duration.ofSeconds(1));
+poolConfig.setTestWhileIdle(true);
+poolConfig.setTimeBetweenEvictionRuns(Duration.ofSeconds(1));
+
+HostAndPort east = new HostAndPort("redis-east.example.com", 14000);
+HostAndPort west = new HostAndPort("redis-west.example.com", 14000);
+
+MultiDbConfig.Builder multiConfig = MultiDbConfig.builder()
+        .database(DatabaseConfig.builder(east, config).connectionPoolConfig(poolConfig).weight(1.0f).build())
+        .database(DatabaseConfig.builder(west, config).connectionPoolConfig(poolConfig).weight(0.5f).build());
+```
+
+The configuration above represents your two Redis deployments: `redis-east` and `redis-west`.
+
+Continue using the `MultiDbConfig.Builder` builder to set your preferred retry and failover configuration.
+Then build a `MultiDbClient`:
+
+```java
+// Configure circuit breaker for failure detection
+multiConfig
+        .failureDetector(MultiDbConfig.CircuitBreakerConfig.builder()
+                .slidingWindowSize(1000)        // Sliding window size in number of calls
+                .failureRateThreshold(50.0f)    // percentage of failures to trigger circuit breaker
+                .minNumOfFailures(500)          // Minimum number of failures before circuit breaker is tripped
+                .build())
+        .failbackSupported(true)                // Enable failback
+        .failbackCheckInterval(1000)            // Check every second the unhealthy database to see if it has recovered
+        .gracePeriod(10000)                     // Keep database disabled for 10 seconds after it becomes unhealthy
+        // Optional: configure retry settings
+        .commandRetry(MultiDbConfig.RetryConfig.builder()
+                .maxAttempts(3)                  // Maximum number of retry attempts (including the initial call)
+                .waitDuration(500)               // Number of milliseconds to wait between retry attempts
+                .exponentialBackoffMultiplier(2) // Exponential backoff factor multiplied against wait duration between retries
+                .build())
+        // Optional: configure fast failover
+        .fastFailover(true)                       // Force closing connections to unhealthy database on failover
+        .retryOnFailover(false);                  // Do not retry failed commands during failover
+
+MultiDbClient multiDbClient = MultiDbClient.builder()
+        .multiDbConfig(multiConfig.build())
+        .build();
+```
+
+In the configuration here, we've set a sliding window size of 1000 and a failure rate threshold of 50%.
+This means that a failover will be triggered only if both 500 out of any 1000 calls to Redis fail (i.e., the failure rate threshold is reached) and the minimum number of failures is also met.
+
+You can now use this `MultiDbClient` instance in your application to execute Redis commands.
+
+## Configuration options
+
+Under the hood, Jedis' failover support relies on [resilience4j](https://resilience4j.readme.io/docs/getting-started),
+a fault-tolerance library that implements [retry](https://resilience4j.readme.io/docs/retry) and [circuit breakers](https://resilience4j.readme.io/docs/circuitbreaker).
+
+Once you configure a `MultiDbClient`, each call to Redis is decorated with a resilience4j retry and circuit breaker.
+
+By default, any call that throws a `JedisConnectionException` will be retried up to 3 times.
+If the call fail then the circuit breaker will record a failure.
+
+The circuit breaker maintains a record of failures in a sliding window data structure.
+If the failure rate reaches a configured threshold (e.g., when 50% of the last 1000 calls have failed),
+then the circuit breaker's state transitions from `CLOSED` to `OPEN`.
+When this occurs, Jedis will attempt to connect to the next Redis database with the highest weight in its client configuration list.
+
+The supported retry and circuit breaker settings, and their default values, are described below.
+You can configure any of these settings using the `MultiDbConfig.Builder` builder.
+Refer the basic usage above for an example of this.
+
+### Retry configuration
+Configuration for command retry behavior is encapsulated in `MultiDbConfig.RetryConfig`.
+Jedis uses the following retry settings:
+
+| Setting                          | Default value              | Description                                                                                                                                                                                                     |
+|----------------------------------|----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Max retry attempts               | 3                          | Maximum number of retry attempts (including the initial call)                                                                                                                                                   |
+| Retry wait duration              | 500 ms                     | Number of milliseconds to wait between retry attempts                                                                                                                                                           |
+| Wait duration backoff multiplier | 2                          | Exponential backoff factor multiplied against wait duration between retries. For example, with a wait duration of 1 second and a multiplier of 2, the retries would occur after 1s, 2s, 4s, 8s, 16s, and so on. |
+| Retry included exception list    | [JedisConnectionException] | A list of Throwable classes that count as failures and should be retried.                                                                                                                                       |
+| Retry ignored exception list     | null                       | A list of Throwable classes to explicitly ignore for the purposes of retry.                                                                                                                                     |
+
+To disable retry, set `maxAttempts` to 1.
+
+### Circuit breaker configuration
+For failover, Jedis uses a circuit breaker to detect when a Redis database has failed.
+Failover configuration is encapsulated in `MultiDbConfig.CircuitBreakerConfig` and can be provided using the `MultiDbConfig.Builder.failureDetector()`.
+Jedis uses the following circuit breaker settings:
+
+| Setting                                 | Default value              | Description                                                                                                              |
+|-----------------------------------------|----------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| Sliding window size                     | 2                          | The size of the sliding window. Units depend on sliding window type. The size represents seconds.                        |
+| Threshold min number of failures        | 1000                       | Minimum number of failures before circuit breaker is tripped.                                                            |
+| Failure rate threshold                  | `10.0f`                    | Percentage of calls within the sliding window that must fail before the circuit breaker transitions to the `OPEN` state. |
+| Circuit breaker included exception list | [JedisConnectionException] | A list of Throwable classes that count as failures and add to the failure rate.                                          |
+| Circuit breaker ignored exception list  | null                       | A list of Throwable classes to explicitly ignore for failure rate calculations.                                          |                                                                                                               |
+
+### Health Check Configuration and Customization
+
+The `MultiDbClient` includes a comprehensive health check system that continuously monitors the availability of Redis databases to enable automatic failover and failback.
+
+The health check system serves several critical purposes in the failover architecture:
+
+1. **Proactive Monitoring**: Continuously monitors passive databases that aren't currently receiving traffic
+2. **Failback Detection**: Determines when a previously failed database has recovered and is ready to accept traffic
+3. **Circuit Breaker Integration**: Works with the circuit breaker pattern to manage database state transitions
+4. **Customizable Strategies**: Supports pluggable health check implementations for different deployment scenarios
+
+The health check system operates independently of your application traffic, running background checks at configurable intervals to assess database health without impacting performance.
+
+#### Available Health Check Types
+
+##### 1. PingStrategy (Default)
+
+The `PingStrategy` is the default health check implementation that uses Redis's `PING` command to verify both connectivity and write capability.
+
+**Use Cases:**
+- General-purpose health checking for most Redis deployments
+- Verifying both read and write operations
+- Simple connectivity validation
+
+**How it works:**
+- Sends `PING` command to the Redis server
+- Expects exact response `"PONG"` to consider the server healthy
+- Any exception or unexpected response marks the server as unhealthy
+
+##### 2. LagAwareStrategy [PREVIEW] (Redis Enterprise)
+
+The `LagAwareStrategy` is designed specifically for Redis Enterprise Active-Active deployments and uses the Redis Enterprise REST API to check database availability and replication lag.
+
+**Use Cases:**
+- Redis Enterprise Active-Active (CRDB) deployments
+- Scenarios where replication lag tolerance is critical
+- Enterprise environments with REST API access
+
+**How it works:**
+- Queries Redis Enterprise REST API for database availability
+- Optionally validates replication lag against configurable thresholds
+- Automatically discovers database IDs based on endpoint hostnames
+
+**Example Configuration:**
+```java
+BiFunction<HostAndPort, Supplier<RedisCredentials>, MultiDbConfig.StrategySupplier> healthCheckStrategySupplier =
+        (HostAndPort dbHostPort, Supplier<RedisCredentials> credentialsSupplier) -> {
+            LagAwareStrategy.Config lagConfig = LagAwareStrategy.Config.builder(dbHostPort, credentialsSupplier)
+                    .interval(5000)                                          // Check every 5 seconds
+                    .timeout(3000)                                           // 3 second timeout
+                    .extendedCheckEnabled(true)
+                    .build();
+
+            return (hostAndPort, jedisClientConfig) -> new LagAwareStrategy(lagConfig);
+        };
+
+// Configure REST API endpoint and credentials
+HostAndPort restEndpoint = new HostAndPort("redis-enterprise-db-fqdn", 9443);
+Supplier<RedisCredentials> credentialsSupplier = () ->
+        new DefaultRedisCredentials("rest-api-user", "pwd");
+
+MultiDbConfig.StrategySupplier lagawareStrategySupplier = healthCheckStrategySupplier.apply(
+        restEndpoint, credentialsSupplier);
+
+MultiDbConfig.DatabaseConfig dbConfig =
+        MultiDbConfig.DatabaseConfig.builder(hostAndPort, clientConfig)
+                .healthCheckStrategySupplier(lagawareStrategySupplier)
+                .build();
+```
+
+##### 3. Custom Health Check Strategies
+
+You can implement custom health check strategies by implementing the `HealthCheckStrategy` interface.
+
+**Use Cases:**
+- Application-specific health validation logic
+- Integration with external monitoring systems
+- Custom performance or latency-based health checks
+
+Use the `healthCheckStrategySupplier()` method to provide a custom health check implementation:
+
+```java
+// Custom strategy supplier
+MultiDbConfig.StrategySupplier customStrategy =
+        (hostAndPort, jedisClientConfig) -> {
+            // Return your custom HealthCheckStrategy implementation
+            return new MyCustomHealthCheckStrategy(hostAndPort, jedisClientConfig);
+        };
+
+MultiDbConfig.DatabaseConfig dbConfig =
+        MultiDbConfig.DatabaseConfig.builder(hostAndPort, clientConfig)
+                .healthCheckStrategySupplier(customStrategy)
+                .weight(1.0f)
+                .build();
+```
+
+You can implement custom health check strategies by implementing the `HealthCheckStrategy` interface:
+
+```java
+MultiDbConfig.StrategySupplier pingStrategy = (hostAndPort, jedisClientConfig) -> {
+    return new HealthCheckStrategy() {
+        @Override
+        public int getInterval() {
+            return 1000; // Check every second
+        }
+
+        @Override
+        public int getTimeout() {
+            return 500; // 500ms timeout
+        }
+
+
+        @Override
+        public int getNumProbes() {
+            return 1;
+        }
+
+        @Override
+        public ProbingPolicy getPolicy() {
+            return ProbingPolicy.BuiltIn.ANY_SUCCESS;
+        }
+
+        @Override
+        public int getDelayInBetweenProbes() {
+            return 100;
+        }
+        @Override
+        public HealthStatus doHealthCheck(Endpoint endpoint) {
+            try (UnifiedJedis jedis = new UnifiedJedis(hostAndPort, jedisClientConfig)) {
+                String result = jedis.ping();
+                return "PONG".equals(result) ? HealthStatus.HEALTHY : HealthStatus.UNHEALTHY;
+            } catch (Exception e) {
+                return HealthStatus.UNHEALTHY;
+            }
+        }
+
+        @Override
+        public void close() {
+            // Cleanup resources if needed
+        }
+    };
+};
+
+MultiDbConfig.DatabaseConfig dbConfig =
+        MultiDbConfig.DatabaseConfig.builder(hostAndPort, clientConfig)
+                .healthCheckStrategySupplier(pingStrategy)
+                .build();
+```
+
+#### Disabling Health Checks
+
+Use the `healthCheckEnabled(false)` method to completely disable health checks:
+
+```java
+MultiDbConfig.DatabaseConfig dbConfig = MultiDbConfig.DatabaseConfig.builder(east, config)
+    .healthCheckEnabled(false) // Disable health checks entirely
+    .build();
+```
+
+### Fallback configuration
+
+Jedis uses the following fallback settings:
+
+| Setting                 | Default value                                         | Description                                        |
+|-------------------------|-------------------------------------------------------|----------------------------------------------------|
+| Fallback exception list | [CallNotPermittedException, JedisConnectionException] | A list of Throwable classes that trigger fallback. |
+
+### Failover callbacks
+
+In the event that Jedis fails over, you may wish to take some action. This might include logging a warning, recording
+a metric, or externally persisting the database connection state, to name just a few examples. For this reason,
+`MultiDbClient` lets you register a custom callback that will be called whenever Jedis
+fails over to a new database.
+
+To use this feature, you'll need to design a class that implements `java.util.function.Consumer`.
+This class must implement the `accept` method, as you can see below.
+
+```java
+public class FailoverReporter implements Consumer<DatabaseSwitchEvent> {
+    
+    @Override
+    public void accept(DatabaseSwitchEvent e) {
+        System.out.println("Jedis failover to database: " + e.getDatabaseName() + " due to " + e.getReason());
+    }
+}
+```
+
+DatabaseSwitchEvent consumer can be registered as follows:
+
+```java
+FailoverReporter reporter = new FailoverReporter();
+MultiDbClient client = MultiDbClient.builder()
+        .databaseSwitchListener(reporter)
+        .build();
+```
+The provider will call your `accept` whenever a failover occurs.
+or directly using lambda expression:
+```java
+MultiDbClient client = MultiDbClient.builder()
+        .databaseSwitchListener(event -> System.out.println("Switched to: " + event.getEndpoint()))
+        .build();
+```
+
+
+## Failing back
+
+Jedis supports automatic failback based on health checks or manual failback using the database selection API.
+
+## Failback scenario
+
+When a failover is triggered, Jedis will attempt to connect to the next Redis server based on the weights of server configurations
+you provide at setup.
+
+For example, recall the `redis-east` and `redis-west` deployments from the basic usage example above.
+Jedis will attempt to connect to `redis-east` first.
+If `redis-east` becomes unavailable (and the circuit breaker transitions), then Jedis will attempt to use `redis-west`.
+
+Now suppose that `redis-east` eventually comes back online.
+You will likely want to fail your application back to `redis-east`.
+
+### Automatic failback based on health checks
+
+When health checks are enabled, Jedis automatically monitors the health of all configured databases, including those that are currently inactive due to previous failures. 
+The automatic failback process works as follows:
+
+1. **Continuous Monitoring**: Health checks run continuously for all databases, regardless of their current active status
+2. **Recovery Detection**: When a previously failed database passes the required number of consecutive health checks, it's marked as healthy
+3. **Weight-Based Failback**: If automatic failback is enabled and a recovered database has a higher weight than the currently active database, Jedis will automatically switch to the recovered database
+4. **Grace Period Respect**: Failback only occurs after the configured grace period has elapsed since the database was marked as unhealthy
+
+## Manual Failback using the database selection API
+
+Once you've determined that it's safe to fail back to a previously-unavailable database,
+you need to decide how to trigger the failback. There are two ways to accomplish this:
+
+`MultiDbClient` exposes a method that you can use to manually select which database Jedis should use.
+To select a different database to use, pass the database's `HostAndPort` to `setActiveDatabase()`:
+```
+        Endpoint endpoint =  new HostAndPort("redis-east.example.com", 14000);
+        client.setActiveDatabase(endpoint);
+```
+
+This method is thread-safe.
+
+If you decide to implement manual failback, you will need a way for external systems to trigger this method in your
+application. For example, if your application exposes a REST API, you might consider creating a REST endpoint
+to call `setActiveDatabase` and fail back the application.
+
+## Dynamic Weight Management
+
+> Introduced in version 7.4.0
+
+Jedis allows you to dynamically adjust database weights at runtime without recreating the `MultiDbClient`.
+
+**Important**: Weight determines the **priority for selecting which database becomes the active database**. At any given time, only ONE database is active and receives all traffic. Weight does not distribute load across databases - it determines which single database Jedis will prefer to use as the active connection.
+
+This is useful for scenarios where you need to change the active database selection priority based on operational conditions, such as:
+
+- Changing which database should be preferred during planned maintenance
+- Adjusting selection priority based on database performance or regional preferences
+- Implementing controlled switchover between databases
+- Responding to changing infrastructure conditions
+
+### Getting and Setting Weights
+
+The `MultiDbClient` provides methods to query and modify database weights at runtime:
+
+```java
+// Get the current weight of a database
+HostAndPort east = new HostAndPort("redis-east.example.com", 14000);
+float currentWeight = client.getWeight(east);
+System.out.println("Current weight: " + currentWeight);
+
+// Set a new weight for a database
+client.setWeight(east, 2.0f);
+```
+
+### Weight Constraints
+
+When setting weights dynamically, the following constraints apply:
+
+- **Weight must be greater than 0**: Attempting to set a weight of 0 or negative values will throw an `IllegalArgumentException`
+- **Endpoint must exist**: The endpoint must be part of the configured databases, otherwise a `JedisValidationException` is thrown
+
+### Runtime Behavior
+
+When you change a database's weight at runtime:
+
+1. **Immediate Effect on Selection**: The weight change takes effect immediately for future active database selection decisions during failover or failback
+2. **Automatic Failback Trigger**: If automatic failback is enabled and you increase a database's weight above the currently active database, Jedis will automatically switch to the higher-weight database during the next periodic failback check (if the database is healthy and the grace period has elapsed)
+3. **No Disruption**: Changing weights does not interrupt ongoing operations or force an immediate switch
+4. **Single Active Database**: Remember that only one database is active at any time - all traffic goes to that single database
+
+### How Weight Affects Database Selection
+
+During failover or failback, Jedis selects the active database by:
+
+1. Filtering for healthy databases (passing health checks, not in grace period, circuit breaker not open)
+2. Sorting the healthy databases by weight in descending order (highest weight first)
+3. Selecting the first database from this sorted list as the active database
+
+### Example: Changing Active Database Priority
+
+Here's a practical example of dynamically adjusting weights to control which database should be active:
+
+```java
+// Initial configuration - primary has higher weight, so it will be selected as active
+HostAndPort primary = new HostAndPort("redis-primary.example.com", 6379);
+HostAndPort secondary = new HostAndPort("redis-secondary.example.com", 6379);
+
+MultiDbConfig config = MultiDbConfig.builder()
+        .database(DatabaseConfig.builder(primary, clientConfig).weight(2.0f).build())
+        .database(DatabaseConfig.builder(secondary, clientConfig).weight(1.0f).build())
+        .failbackSupported(true)
+        .failbackCheckInterval(1000)
+        .build();
+
+MultiDbClient client = MultiDbClient.builder()
+        .multiDbConfig(config)
+        .build();
+
+// At this point, 'primary' is the active database (weight 2.0 > 1.0)
+
+// Before planned maintenance on primary, make secondary the preferred database
+client.setWeight(secondary, 3.0f);  // Now secondary has highest weight
+// During the next failback check, Jedis will switch to secondary as the active database
+
+// After maintenance, restore primary as the preferred database
+client.setWeight(primary, 4.0f);  // Now primary has highest weight again
+// During the next failback check, Jedis will switch back to primary as the active database
+```
+
+### Monitoring Database Switches
+
+You can combine weight changes with failover callbacks to monitor when the active database switches due to weight adjustments:
+
+```java
+MultiDbClient client = MultiDbClient.builder()
+        .multiDbConfig(config)
+        .databaseSwitchListener(event -> {
+            System.out.println("Active database switched to: " + event.getEndpoint() +
+                             " due to: " + event.getReason());
+        })
+        .build();
+
+// Change weight - may trigger automatic failback to switch active database
+client.setWeight(secondary, 5.0f);
+```
+
+## Dynamic Database Management
+
+Jedis allows you to dynamically add and remove database endpoints at runtime without recreating the `MultiDbClient`. This provides flexibility for scenarios such as:
+
+- Adding new database replicas or regions as they become available
+- Removing databases during planned maintenance or decommissioning
+- Scaling your Redis infrastructure dynamically
+- Responding to infrastructure changes without application restarts
+
+### Adding Databases at Runtime
+
+The `MultiDbClient` provides two overloaded methods for adding databases dynamically:
+
+#### Method 1: Using DatabaseConfig
+
+This method provides maximum flexibility for advanced configurations including custom health check strategies, connection pool settings, and other database-specific options.
+
+```java
+// Create a fully configured DatabaseConfig
+HostAndPort newEndpoint = new HostAndPort("redis-new.example.com", 6379);
+JedisClientConfig clientConfig = DefaultJedisClientConfig.builder()
+        .user("cache").password("secret").build();
+
+DatabaseConfig databaseConfig = DatabaseConfig.builder(newEndpoint, clientConfig)
+        .weight(1.5f).connectionPoolConfig(poolConfig).healthCheckEnabled(true).build();
+
+// Add the database to the client
+client.addDatabase(databaseConfig);
+```
+
+#### Method 2: Using Endpoint, Weight, and ClientConfig
+
+This is a convenience method for simpler configurations when you don't need advanced customization.
+
+```java
+HostAndPort newEndpoint = new HostAndPort("redis-new.example.com", 6379);
+JedisClientConfig clientConfig = DefaultJedisClientConfig.builder()
+        .user("cache").password("secret").build();
+
+// Add the database with basic configuration
+client.addDatabase(newEndpoint, 1.5f, clientConfig);
+```
+
+### Removing Databases at Runtime
+
+You can remove database endpoints dynamically using the `removeDatabase()` method:
+
+```java
+HostAndPort endpointToRemove = new HostAndPort("redis-old.example.com", 6379);
+
+// Remove the database from the client
+client.removeDatabase(endpointToRemove);
+```
+
+### Behavior and Constraints
+
+When adding or removing databases, the following behavior applies:
+
+#### Adding Databases
+
+- **Immediate Availability**: The new endpoint becomes available for failover operations immediately after being added
+- **Health Check Integration**: If health checks are configured, the new database will be monitored according to the configured health check strategy
+- **Duplicate Prevention**: Attempting to add an endpoint that already exists will throw a `JedisValidationException`
+- **Weight-Based Selection**: The new database participates in weight-based active database selection according to its configured weight
+
+#### Removing Databases
+
+- **Automatic Failover**: If the removed endpoint is currently the active database, Jedis will automatically failover to the next available healthy endpoint based on weight priority
+- **Last Database Protection**: You cannot remove the last remaining endpoint - attempting to do so will throw a `JedisValidationException`
+- **Non-Existent Endpoint**: Attempting to remove an endpoint that doesn't exist will throw a `JedisValidationException`
+- **Resource Cleanup**: The removed database's connections and resources are properly closed and cleaned up
+- **Health Check Cleanup**: Health checks for the removed database are automatically stopped and unregistered
+
+### Querying Configured Databases
+
+You can retrieve the set of all currently configured database endpoints:
+
+```java
+Set<Endpoint> endpoints = client.getDatabaseEndpoints();
+System.out.println("Configured databases: " + endpoints);
+```
+
+### Complete Example: Dynamic Database Management
+
+Here's a practical example demonstrating dynamic database management:
+
+```java
+// Initial setup with two databases, primary and secondary.
+HostAndPort primary = new HostAndPort("redis-primary.example.com", 6379);
+HostAndPort secondary = new HostAndPort("redis-secondary.example.com", 6379);
+
+JedisClientConfig clientConfig = DefaultJedisClientConfig.builder()
+        .user("cache").password("secret").build();
+
+MultiDbConfig config = MultiDbConfig.builder()
+        .database(DatabaseConfig.builder(primary, clientConfig).weight(2.0f).build())
+        .database(DatabaseConfig.builder(secondary, clientConfig).weight(1.0f).build())
+        .failbackSupported(true)
+        .build();
+
+MultiDbClient client = MultiDbClient.builder()
+        .multiDbConfig(config)
+        .databaseSwitchListener(event -> {
+            System.out.println("Switched to: " + event.getEndpoint() +
+                             " due to: " + event.getReason());
+        })
+        .build();
+
+// Add a new database in a different region
+HostAndPort newRegion = new HostAndPort("redis-eu.example.com", 6379);
+client.addDatabase(newRegion, 1.0f, clientConfig);
+System.out.println("Added new database: " + newRegion);
+
+// Verify the database was added
+Set<Endpoint> endpoints = client.getDatabaseEndpoints();
+System.out.println("Current databases: " + endpoints);
+// Output: [redis-primary.example.com:6379, redis-secondary.example.com:6379, redis-eu.example.com:6379]
+
+// Later, remove the secondary database for maintenance
+client.removeDatabase(secondary);
+System.out.println("Removed database: " + secondary);
+// If secondary was active, automatic failover occurs to primary or newRegion
+
+// Verify the database was removed
+endpoints = client.getDatabaseEndpoints();
+System.out.println("Current databases: " + endpoints);
+// Output: [redis-primary.example.com:6379, redis-eu.example.com:6379]
+
+```
+
+### Thread Safety
+
+Both `addDatabase()` and `removeDatabase()` methods are thread-safe and can be called concurrently from multiple threads. The client ensures that database additions and removals are properly synchronized with ongoing operations.
+
+## Troubleshooting Failover and Failback Issues
+
+#### Health Checks Always Report Unhealthy
+
+**Common causes:**
+- Timeout too aggressive for network conditions
+- Authentication issues with Redis server
+- Network connectivity problems
+
+**Solutions:**
+```java
+// Increase timeout values
+HealthCheckStrategy.Config config = HealthCheckStrategy.Config.builder()
+    .timeout(3000)  // Increase from default 1000ms
+    .build();
+```
+
+#### Intermittent Health Check Failures
+
+**Solutions:**
+```java
+// Require more consecutive successes for stability
+HealthCheckStrategy.Config config = HealthCheckStrategy.Config.builder()
+    .interval(5000)                 // Less frequent checks
+    .timeout(2000)                  // More generous timeout
+    .build();
+```
+
+#### Slow Failback After Recovery
+
+**Solutions:**
+```java
+// Faster recovery configuration
+HealthCheckStrategy.Config config = HealthCheckStrategy.Config.builder()
+    .interval(1000)                    // More frequent checks
+    .build();
+
+// Adjust failback timing
+MultiDbConfig multiConfig = MultiDbConfig.builder()
+        .gracePeriod(5000)                 // Shorter grace period
+        .build();
+```
+
+## Need help or have questions?
+For assistance with this automatic failover and failback feature,
+[start a discussion](https://github.com/redis/jedis/discussions/new?category=q-a).
