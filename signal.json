@@ -1,0 +1,10 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "src/test/java/redis/clients/jedis/executors/MultiNodeResultAggregatorTest.java",
+    "src/test/java/redis/clients/jedis/executors/ClusterCommandExecutorTest.java",
+    "src/test/java/redis/clients/jedis/executors/RetryableCommandExecutorTest.java"
+  ],
+  "validation_test_file_count": 3,
+  "validation_tests_executed": null
+}
