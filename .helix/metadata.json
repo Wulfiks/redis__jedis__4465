@@ -1,12 +1,12 @@
 [
   {
     "instance_id": "7a0ad456-e601-4a56-8c56-e109edfd8ca4",
-    "task_title": "7a0ad456-e601-4a56-8c56-e109edfd8ca4",
+    "task_title": "Support default reply aggregation for immutable collections in cluster executors",
     "problem_statement": "In Jedis cluster command execution, some collection-valued replies still break in the default reply aggregation path in the cluster executor layer when multi-node or multi-shard operations combine successful results. Reproduction: run a clustered operation whose successful collection replies need to collapse into one default-aggregated result across more than one node or shard. Actual behavior: reply aggregation can fail instead of returning the combined collection result. Expected behavior: the default reply aggregation path in cluster executors should continue producing one merged collection reply for these operations while preserving the surrounding cluster command behavior.",
     "problem_statement_variant": "In Jedis clustered execution, some collection replies that should aggregate under the default reply behavior still fail before a combined result is returned. Successful replies should still collapse into one collection result instead of stopping during aggregation.",
     "hints": "The bug lives in the cluster reply aggregation path used by multi-node and multi-shard execution, centered in `src/main/java/redis/clients/jedis/executors/ClusterReplyAggregator.java` and exercised through `MultiNodeResultAggregator`.",
     "repo": "jedis",
-    "repo_path_or_url": "https://github.com/handshake-coding/redis__jedis__4465",
+    "repo_path_or_url": "https://github.com/redis/jedis",
     "FAIL_TO_PASS": "[\"src/test/java/redis/clients/jedis/executors/MultiNodeResultAggregatorTest.java\"]",
     "PASS_TO_PASS": "[\"src/test/java/redis/clients/jedis/executors/ClusterCommandExecutorTest.java\",\"src/test/java/redis/clients/jedis/executors/RetryableCommandExecutorTest.java\"]",
     "language": "Java",
