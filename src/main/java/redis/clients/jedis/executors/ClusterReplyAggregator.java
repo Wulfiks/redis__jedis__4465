@@ -1,6 +1,8 @@
 package redis.clients.jedis.executors;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -114,8 +116,15 @@ final class ClusterReplyAggregator {
         // Mutate existing ArrayList in place - avoids creating new collection
         ((ArrayList<Object>) existingList).ensureCapacity(existingList.size() + newList.size());
       }
-      existingList.addAll(newList);
-      return (T) existingList;
+      try {
+        existingList.addAll(newList);
+        return (T) existingList;
+      } catch (UnsupportedOperationException e) {
+        List<Object> merged = new ArrayList<>(existingList.size() + newList.size());
+        merged.addAll(existingList);
+        merged.addAll(newList);
+        return (T) merged;
+      }
     }
 
     // Handle JedisByteHashMap types - mutate in place
@@ -123,8 +132,15 @@ final class ClusterReplyAggregator {
     if (existing instanceof JedisByteHashMap && newReply instanceof JedisByteHashMap) {
       JedisByteHashMap existingMap = (JedisByteHashMap) existing;
       JedisByteHashMap newMap = (JedisByteHashMap) newReply;
-      existingMap.putAll(newMap);
-      return (T) existingMap;
+      try {
+        existingMap.putAll(newMap);
+        return (T) existingMap;
+      } catch (UnsupportedOperationException e) {
+        JedisByteHashMap merged = new JedisByteHashMap();
+        merged.putAll(existingMap);
+        merged.putAll(newMap);
+        return (T) merged;
+      }
     }
 
     // Handle JedisByteMap types - mutate in place
@@ -132,24 +148,45 @@ final class ClusterReplyAggregator {
     if (existing instanceof JedisByteMap && newReply instanceof JedisByteMap) {
       JedisByteMap<Object> existingMap = (JedisByteMap<Object>) existing;
       JedisByteMap<Object> newMap = (JedisByteMap<Object>) newReply;
-      existingMap.putAll(newMap);
-      return (T) existingMap;
+      try {
+        existingMap.putAll(newMap);
+        return (T) existingMap;
+      } catch (UnsupportedOperationException e) {
+        JedisByteMap<Object> merged = new JedisByteMap<>();
+        merged.putAll(existingMap);
+        merged.putAll(newMap);
+        return (T) merged;
+      }
     }
 
     // Handle Map types - mutate in place
     if (existing instanceof Map && newReply instanceof Map) {
       Map<Object, Object> existingMap = (Map<Object, Object>) existing;
       Map<Object, Object> newMap = (Map<Object, Object>) newReply;
-      existingMap.putAll(newMap);
-      return (T) existingMap;
+      try {
+        existingMap.putAll(newMap);
+        return (T) existingMap;
+      } catch (UnsupportedOperationException e) {
+        Map<Object, Object> merged = new LinkedHashMap<>(existingMap.size() + newMap.size());
+        merged.putAll(existingMap);
+        merged.putAll(newMap);
+        return (T) merged;
+      }
     }
 
     // Handle Set types - mutate in place if HashSet, otherwise create once
     if (existing instanceof Set && newReply instanceof Set) {
       Set<Object> existingSet = (Set<Object>) existing;
       Set<Object> newSet = (Set<Object>) newReply;
-      existingSet.addAll(newSet);
-      return (T) existingSet;
+      try {
+        existingSet.addAll(newSet);
+        return (T) existingSet;
+      } catch (UnsupportedOperationException e) {
+        Set<Object> merged = new LinkedHashSet<>(existingSet.size() + newSet.size());
+        merged.addAll(existingSet);
+        merged.addAll(newSet);
+        return (T) merged;
+      }
     }
 
     // For other types, throw UnsupportedAggregationException
