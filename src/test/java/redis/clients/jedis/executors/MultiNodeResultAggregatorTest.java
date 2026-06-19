@@ -733,4 +733,111 @@ public class MultiNodeResultAggregatorTest {
     assertTrue(replies.containsKey(UNKNOWN_NODE));
     assertTrue(replies.containsKey(NODE_2));
   }
+
+  @Test
+  public void testGetResult_default_immutableList_aggregatesSuccessfully() {
+    MultiNodeResultAggregator<java.util.List<String>> aggregator = new MultiNodeResultAggregator<>(
+        ResponsePolicy.DEFAULT);
+
+    java.util.List<String> list1 = java.util.Collections.unmodifiableList(java.util.Arrays.asList("a"));
+    java.util.List<String> list2 = java.util.Collections.singletonList("b");
+
+    aggregator.addSuccess(NODE_1, list1);
+    aggregator.addSuccess(NODE_2, list2);
+
+    java.util.List<String> result = aggregator.getResult();
+    assertEquals(java.util.Arrays.asList("a", "b"), result, "Should aggregate immutable lists into a new list");
+  }
+
+  @Test
+  public void testGetResult_default_immutableMap_aggregatesSuccessfully() {
+    MultiNodeResultAggregator<java.util.Map<String, String>> aggregator = new MultiNodeResultAggregator<>(
+        ResponsePolicy.DEFAULT);
+
+    java.util.Map<String, String> map1 = java.util.Collections.unmodifiableMap(java.util.Collections.singletonMap("k1", "v1"));
+    java.util.Map<String, String> map2 = java.util.Collections.singletonMap("k2", "v2");
+
+    aggregator.addSuccess(NODE_1, map1);
+    aggregator.addSuccess(NODE_2, map2);
+
+    java.util.Map<String, String> result = aggregator.getResult();
+    assertEquals(2, result.size());
+    assertEquals("v1", result.get("k1"));
+    assertEquals("v2", result.get("k2"));
+  }
+
+  @Test
+  public void testGetResult_default_immutableSet_aggregatesSuccessfully() {
+    MultiNodeResultAggregator<java.util.Set<String>> aggregator = new MultiNodeResultAggregator<>(
+        ResponsePolicy.DEFAULT);
+
+    java.util.Set<String> set1 = java.util.Collections.unmodifiableSet(java.util.Collections.singleton("a"));
+    java.util.Set<String> set2 = java.util.Collections.singleton("b");
+
+    aggregator.addSuccess(NODE_1, set1);
+    aggregator.addSuccess(NODE_2, set2);
+
+    java.util.Set<String> result = aggregator.getResult();
+    assertTrue(result.contains("a"));
+    assertTrue(result.contains("b"));
+    assertEquals(2, result.size());
+  }
+
+  @Test
+  public void testGetResult_default_immutableJedisByteHashMap_aggregatesSuccessfully() {
+    MultiNodeResultAggregator<redis.clients.jedis.util.JedisByteHashMap> aggregator = new MultiNodeResultAggregator<>(
+        ResponsePolicy.DEFAULT);
+
+    redis.clients.jedis.util.JedisByteHashMap map1 = new redis.clients.jedis.util.JedisByteHashMap() {
+      @Override
+      public void putAll(java.util.Map<? extends byte[], ? extends byte[]> m) {
+        throw new UnsupportedOperationException();
+      }
+    };
+    byte[] key1 = "k1".getBytes();
+    byte[] val1 = "v1".getBytes();
+    map1.put(key1, val1);
+
+    redis.clients.jedis.util.JedisByteHashMap map2 = new redis.clients.jedis.util.JedisByteHashMap();
+    byte[] key2 = "k2".getBytes();
+    byte[] val2 = "v2".getBytes();
+    map2.put(key2, val2);
+
+    aggregator.addSuccess(NODE_1, map1);
+    aggregator.addSuccess(NODE_2, map2);
+
+    redis.clients.jedis.util.JedisByteHashMap result = aggregator.getResult();
+    assertNotNull(result);
+    assertTrue(result.containsKey(key1));
+    assertTrue(result.containsKey(key2));
+  }
+
+  @Test
+  public void testGetResult_default_immutableJedisByteMap_aggregatesSuccessfully() {
+    MultiNodeResultAggregator<redis.clients.jedis.util.JedisByteMap<byte[]>> aggregator = new MultiNodeResultAggregator<>(
+        ResponsePolicy.DEFAULT);
+
+    redis.clients.jedis.util.JedisByteMap<byte[]> map1 = new redis.clients.jedis.util.JedisByteMap<byte[]>() {
+      @Override
+      public void putAll(java.util.Map<? extends byte[], ? extends byte[]> m) {
+        throw new UnsupportedOperationException();
+      }
+    };
+    byte[] key1 = "k1".getBytes();
+    byte[] val1 = "v1".getBytes();
+    map1.put(key1, val1);
+
+    redis.clients.jedis.util.JedisByteMap<byte[]> map2 = new redis.clients.jedis.util.JedisByteMap<>();
+    byte[] key2 = "k2".getBytes();
+    byte[] val2 = "v2".getBytes();
+    map2.put(key2, val2);
+
+    aggregator.addSuccess(NODE_1, map1);
+    aggregator.addSuccess(NODE_2, map2);
+
+    redis.clients.jedis.util.JedisByteMap<byte[]> result = aggregator.getResult();
+    assertNotNull(result);
+    assertTrue(result.containsKey(key1));
+    assertTrue(result.containsKey(key2));
+  }
 }
